@@ -38,9 +38,15 @@
  *
  * Usage:
  * -----
- * rcnfs [-a ANVIL_IP] rclone_config
+ * rcnfs [-a ANVIL_IP] REMOTE:[BUCKET[:BUCKET...]]
  *
- * Example: ./rcnfs -a 10.200.104.39 S3:hs-rclone
+ * Examples:
+ *   ./rcnfs S3:                          # serve the whole remote
+ *   ./rcnfs S3:hs-rclone                 # serve just one bucket (no
+ *                                        # ListAllMyBuckets required)
+ *   ./rcnfs S3:bucket-a:bucket-b         # serve REMOTE: filtered with
+ *                                        # --include (needs ListAllMyBuckets)
+ *   ./rcnfs -a 10.200.104.39 S3:hs-rclone
  *
  * Example mount command from a client:
  * ------------------------------------
@@ -712,6 +718,25 @@ main(int argc, char **argv) {
         bucket->next = buckets;
         buckets = bucket;
     }
+
+    /* Single-bucket case: append the bucket onto the remote and drop it
+     * from the filter list. This serves the bucket directly so rclone
+     * never needs s3:ListAllMyBuckets. Multi-bucket case (2+) falls
+     * through to the original behaviour: serve REMOTE: with --include.
+     */
+    if (buckets && buckets->next == NULL) {
+        size_t r_len = strlen(remote);
+        if (r_len + strlen(buckets->name) + 1 > sizeof(remote)) {
+            fprintf(stderr, "Bucket name too long for remote path.\n");
+            free_buckets();
+            free(input);
+            return 1;
+        }
+        strncat(remote, buckets->name, sizeof(remote) - r_len - 1);
+        free_buckets();
+    }
+    printf("rclone path: %s\n", remote);
+    if (buckets) printf("multi-bucket --include filter enabled.\n");
 
     startup();
 

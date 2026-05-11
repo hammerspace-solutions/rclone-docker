@@ -269,21 +269,23 @@ rcnfs [-a|--anvil <IP>] REMOTE:[BUCKET:[BUCKET...]]
 
 | Argument | Meaning |
 |----------|---------|
-| `-a IP` / `--anvil IP` | Also export read-write with `no_root_squash` to this specific host. The world export remains read-write with `root_squash`. |
+| `-a IP` / `--anvil IP` | Reserved; kept for backwards compatibility with the old `exportfs` design. The current build no longer uses the kernel exports table, so this flag is parsed but does not affect access control. |
 | `REMOTE:` | The rclone remote name from your `rclone.conf`, followed by a colon. |
-| `BUCKET:` | Optional. Restrict the export to one or more buckets/paths under the remote. Multiple buckets are colon-separated. |
+| `BUCKET:` | Optional. One or more bucket names, colon-separated. See below for the behavioral difference between one vs. many. |
 
-Examples:
+Single-bucket vs. multi-bucket modes:
 
 ```bash
-# Whole remote
+# Whole remote - rclone serves "S3:". Needs ListAllMyBuckets.
+S3:
+
+# One bucket - rclone serves "S3:my-bucket" directly. No ListBuckets call;
+# the IAM key only needs access to my-bucket.
 S3:my-bucket
 
-# Two buckets only
+# Two or more buckets - rclone serves "S3:" with --include /{a,b}/**.
+# The IAM key DOES need s3:ListAllMyBuckets to enumerate the root.
 S3:bucket-a:bucket-b
-
-# Anvil host gets unsquashed root, world still gets squashed root
--a 10.0.0.5 S3:my-bucket
 ```
 
 ### Volumes
