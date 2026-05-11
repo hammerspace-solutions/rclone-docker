@@ -27,7 +27,6 @@ discover and mount it. Registration is handled by a small C helper, `rcnfs`, whi
   - [Volumes](#volumes)
   - [Environment variables](#environment-variables)
   - [Capabilities and networking](#capabilities-and-networking)
-- [`/export` design note](#export-design-note)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 
@@ -52,60 +51,47 @@ whole stack runs in one container.
 ## How it works
 
 ```
-                       ┌─────────────────────── container ───────────────────────┐
-                       │                                                          │
- NFS client ──port 111─┼──▶ rpcbind ──┐                                            │
-                       │              │ "NFS is on TCP/2049"                       │
-                       │              ▼                                            │
-                       │   ┌─── rcnfs (PID 1 child) ──────────────────────┐        │
-                       │   │   pmap_set(NFS, 3, TCP, 2049)                │        │
-                       │   │   spawn rpc.mountd  ──── MOUNT protocol      │        │
-                       │   │   spawn rclone serve nfs --addr 0.0.0.0:2049 │        │
-                       │   │   exportfs *:/                               │        │
-                       │   └──────────────────────────────────────────────┘        │
- NFS client ─port 2049─┼─────────────────────▶ rclone serve nfs ──▶ remote storage │
-                       │                                                          │
-                       └──────────────────────────────────────────────────────────┘
+                       ┌──────────────── container ─────────────────┐
+                       │                                             │
+ NFS client ──port 111─┼──▶ rpcbind ──┐                                │
+                       │              │ "NFS is on 2049, MOUNT too"    │
+                       │              ▼                                │
+                       │   ┌─── rcnfs ──────────────────────────┐      │
+                       │   │   pmap_set NFS   (100003) -> 2049  │      │
+                       │   │   pmap_set MOUNT (100005) -> 2049  │      │
+                       │   │   spawn rclone serve nfs :2049     │      │
+                       │   └────────────────────────────────────┘      │
+ NFS client ─port 2049─┼─────────▶ rclone serve nfs ─▶ remote storage  │
+                       │                                                │
+                       └────────────────────────────────────────────────┘
 ```
 
-`tini` is PID 1 and forwards signals to the entrypoint, which starts `rpcbind` and `exec`s
-`rcnfs`. When the container stops, `rcnfs`'s trap handler unexports, unregisters, and kills
-the children before exiting.
+`rclone serve nfs` implements **both** the NFS and MOUNT protocols on the same TCP port and
+uses its own file-handle namespace, so the kernel `rpc.mountd`/`exportfs`/`nfsd` are not
+used. `rcnfs` simply points portmapper at rclone for both protocols.
+
+`tini` is PID 1 and forwards signals to the entrypoint, which starts (or reuses) `rpcbind`
+and `exec`s `rcnfs`. When the container stops, `rcnfs`'s trap handler unregisters from
+portmapper and kills `rclone` before exiting.
 
 ## Prerequisites
-
-### Host kernel
-
-`rcnfs` mounts the kernel `nfsd` pseudo-filesystem at `/proc/fs/nfsd` so that `rpc.mountd` and
-`exportfs` work. That requires the **`nfsd` kernel module** to be available on the host:
-
-```bash
-sudo modprobe nfsd
-lsmod | grep nfsd      # should now show nfsd
-```
-
-Add `nfsd` to `/etc/modules-load.d/` if you want it loaded at boot.
-
-> **Note on Docker Desktop (macOS / Windows):** the Linux VM that ships with Docker Desktop
-> does not include the `nfsd` module. This image is intended for **Linux hosts**. On Docker
-> Desktop the build will succeed but the runtime will fail to mount `nfsd`.
 
 ### Host ports
 
 Because the container uses `--network host` (recommended), the following ports on the **host**
-must be free:
+must be free (or, in the case of `rpcbind`, available for the container to either coexist
+with or take over):
 
-| Port  | Proto    | Purpose             |
-|-------|----------|---------------------|
-| 111   | tcp/udp  | rpcbind / portmap   |
-| 2049  | tcp/udp  | NFS                 |
-| 20048 | tcp/udp  | rpc.mountd          |
+| Port  | Proto    | Purpose                          |
+|-------|----------|----------------------------------|
+| 111   | tcp/udp  | rpcbind / portmap                |
+| 2049  | tcp      | NFS + MOUNT (both served by rclone) |
 
-If the host is already running its own `rpcbind` or `nfs-kernel-server`, stop and disable them
-before starting this container:
+If the host runs its own `rpcbind`, the container's entrypoint will detect it and reuse it
+for registrations. If the host runs `nfs-kernel-server`, port 2049 is taken — stop it:
 
 ```bash
-sudo systemctl disable --now rpcbind nfs-server
+sudo systemctl disable --now nfs-server
 ```
 
 ## Repository layout
@@ -226,12 +212,21 @@ From any Linux NFS client on the same network as the Docker host:
 
 ```bash
 sudo mkdir -p /mnt/rclone
-sudo mount -t nfs -o vers=3 <docker-host-ip>:/export /mnt/rclone
+sudo mount -t nfs -o vers=3,proto=tcp,nolock,mountproto=tcp \
+    <docker-host-ip>:/ /mnt/rclone
 ls /mnt/rclone
 ```
 
-Use `vers=3`; rclone's NFS server is NFSv3. The export path is `/export` (not `/`) — see
-[`/export` design note](#export-design-note) for the reason.
+The required options are:
+
+- `vers=3` — rclone serves NFSv3 only.
+- `proto=tcp,mountproto=tcp` — rclone speaks TCP only; without this the client may try UDP
+  and get "version or transport protocol is not supported".
+- `nolock` — rclone does not implement the NLM lock protocol and there is no `rpc.statd`
+  in the container; without this the client refuses the mount.
+
+The path after the colon is ignored by rclone (its MOUNT handler always returns the rclone
+remote's root regardless), so `:/`, `:/foo`, and `:/anything` are equivalent.
 
 ## Verify the service
 
@@ -311,82 +306,41 @@ honoured, e.g. `RCLONE_VERBOSE=2` for more logging.
 
 | Option | Why |
 |--------|-----|
-| `--network host` | Simplest path. `rpc.mountd` registers a dynamic port with `rpcbind`; bridge networking would NAT only specific ports and break discovery. |
-| `--cap-add SYS_ADMIN` | Required for `mount("nfsd", "/proc/fs/nfsd", "nfsd", ...)` and for `exportfs` to modify the kernel exports table. |
-| `--privileged` | Fallback if `SYS_ADMIN` alone is rejected by an AppArmor/seccomp profile on the host. |
-
-## `/export` design note <a id="export-design-note"></a>
-
-`rcnfs` exports the path **`/export`** (not `/`). This is deliberate.
-
-The kernel `exportfs` command refuses to advertise a path whose underlying filesystem does
-not implement NFS export operations. The default container root filesystem (`overlay2`)
-does not, so an `exportfs *:/` always fails with `/ does not support NFS export`. To get
-around this, the entrypoint mounts a small **tmpfs** at `/export` before starting `rcnfs`,
-and `rcnfs` advertises `/export` to the kernel exports table.
-
-This only changes the *advertised mount path*. Data is still served by `rclone serve nfs`
-against your configured remote — clients mount `host:/export` and see the contents of your
-rclone remote, not the contents of the in-container tmpfs.
-
-If you'd rather supply your own backing filesystem for `/export` (e.g. an ext4 bind-mount
-from the host), mount it onto `/export` before the entrypoint runs and the entrypoint will
-skip the tmpfs step:
-
-```bash
-docker run ... -v /srv/rclone-export:/export rclone-nfs ...
-```
+| `--network host` | Simplest path. Without it, `rpcbind` on port 111 and the rclone NFS port 2049 must both be published, and clients still reach `rpcbind` via the host. |
+| `--cap-add SYS_ADMIN` | Required for the container's `rpcbind` to bind privileged port 111 and for `mount.nfs`-style setup operations. Use `--privileged` if SYS_ADMIN alone is rejected. |
 
 ## Troubleshooting
-
-**`exportfs: /export does not support NFS export`**
-The entrypoint failed to mount tmpfs on `/export`, or you bind-mounted a path whose
-filesystem doesn't support NFS export (e.g. another overlay). Confirm with:
-```bash
-docker exec rclone-nfs sh -c 'mountpoint /export && cat /proc/mounts | grep " /export "'
-```
-The mount line should show `tmpfs`, `ext4`, `xfs`, `btrfs`, or similar — **not** `overlay`.
-Ensure `--cap-add SYS_ADMIN` is set, or bind-mount an ext4/xfs/btrfs host path onto
-`/export`.
-
-**`Failed to mount nfsd: No such file or directory` (or `Operation not permitted`)**
-The `nfsd` kernel module is not loaded or the container lacks `CAP_SYS_ADMIN`. Run
-`sudo modprobe nfsd` on the host and ensure `--cap-add SYS_ADMIN` (or `--privileged`).
 
 **`failed to register rclone NFS program with rpcbind`**
 `rpcbind` did not start in time, or another `rpcbind` is already running on the host (port 111
 collision under `--network host`). Stop the host's `rpcbind` service.
 
-**Client gets `requested NFS version or transport protocol is not supported` but the container
-logs look fine**
-The container is registering NFS/mountd into its **own** rpcbind via a private Unix socket
-because the host has its own `rpcbind` already bound to port 111. Clients query the host's
-rpcbind on 111 and get nothing useful back. Verify with `rpcinfo -p 127.0.0.1` on the docker
-host — if you do **not** see `100003 ... nfs` and `100005 ... mountd`, this is the case.
+**Client gets `requested NFS version or transport protocol is not supported`**
+Common causes, in order of likelihood:
 
-Fix by stopping the host's rpcbind so the container's takes port 111:
-```bash
-sudo systemctl disable --now rpcbind rpcbind.socket
-docker restart rclone-nfs
-```
-The entrypoint also auto-detects this situation as of the current image — it will reuse the
-host's rpcbind if one is already listening on 127.0.0.1:111 rather than starting a competing
-one. So an alternative is to keep the host's rpcbind and let it carry the registrations.
+1. The mount is going over UDP. rclone speaks TCP only — add `proto=tcp,mountproto=tcp`.
+2. The client is asking for NFSv4. rclone serves v3 only — use `vers=3`.
+3. The container's `rpcbind` is shadowed by one on the host. With `--network host`, port 111
+   stays in the host's namespace, so an existing host `rpcbind` blocks the container's. The
+   entrypoint detects this and reuses the host's rpcbind for registrations — but if the
+   host's rpcbind started **after** the container, you'll need to restart the container
+   (`docker restart rclone-nfs`). Verify on the docker host:
+   ```bash
+   rpcinfo -p 127.0.0.1   # must list 100003 nfs (port 2049) AND 100005 mountd (port 2049)
+   ```
 
-When mounting from the client, use TCP and disable locking (rclone doesn't run `rpc.statd`):
-```bash
-sudo mount -t nfs -o vers=3,proto=tcp,nolock,mountproto=tcp \
-    <server>:/export /mnt/rclone
-```
+**`mount.nfs: mount system call failed` (or `Bad file handle suffix` in rclone logs)**
+The client is talking to the kernel `rpc.mountd` instead of rclone's MOUNT handler, getting
+a handle that rclone does not recognize. `rcnfs` overrides this by registering MOUNT
+(program 100005) at rclone's port — confirm with `rpcinfo -p` that **mountd is on port 2049**
+(same as NFS). If mountd is on a random high port instead, an external `rpc.mountd` snuck
+in after `rcnfs` registered; restart the container.
+
+**`mount.nfs: rpc.statd is not running but is required for remote locking`**
+Run with `-o nolock` (rclone does not implement NLM file locking).
 
 **`bind: Address already in use` on port 2049**
 The host's `nfs-kernel-server` is running. `sudo systemctl disable --now nfs-server`.
-
-**Client gets `mount.nfs: requested NFS version or transport protocol is not supported`**
-You're trying to mount with `vers=4`. The rclone NFS server is v3-only — use `-o vers=3`.
-
-**Client gets `mount.nfs: rpc.statd is not running but is required for remote locking`**
-Either run `rpc.statd` on the **client**, or mount with `-o nolock`.
 
 **Build can't reach `github.com/rclone/rclone.git`**
 Behind a corporate proxy, pass build args:
@@ -400,9 +354,9 @@ docker build \
 **Want to see what's happening inside the container**
 ```bash
 docker exec -it rclone-nfs bash
-rpcinfo -p 127.0.0.1
-exportfs -v
-ps -ef
+rpcinfo -p 127.0.0.1     # NFS and MOUNT should both list port 2049
+ps -ef                   # rcnfs supervises rclone
+docker logs rclone-nfs   # rclone's own log lines
 ```
 
 ## Limitations

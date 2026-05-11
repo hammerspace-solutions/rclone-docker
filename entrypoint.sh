@@ -35,24 +35,8 @@ EOF
     exit 2
 fi
 
-# rpcbind and rpc.mountd need these to exist
-mkdir -p /run/rpcbind /var/lib/nfs /export
-touch /var/lib/nfs/etab /var/lib/nfs/rmtab
-
-# rcnfs exports /export, not /, because overlay2 (the typical container root
-# filesystem) does not support being NFS-exported. Mount a tmpfs there if the
-# path is still on the overlay. Requires CAP_SYS_ADMIN.
-if mountpoint -q /export; then
-    echo "[entrypoint] /export is already a mountpoint, leaving it alone."
-else
-    echo "[entrypoint] Mounting tmpfs on /export..."
-    if ! mount -t tmpfs -o size=16m,mode=0755 tmpfs /export; then
-        echo "ERROR: failed to mount tmpfs on /export." >&2
-        echo "Run the container with --cap-add SYS_ADMIN (or --privileged), or" >&2
-        echo "pre-bind a real filesystem to /export via -v / --tmpfs." >&2
-        exit 1
-    fi
-fi
+# rpcbind needs this dir to exist when it does start
+mkdir -p /run/rpcbind
 
 # With --network host, port 111 lives in the host's network namespace. If the
 # host already runs its own rpcbind, our container's rpcbind cannot bind 111

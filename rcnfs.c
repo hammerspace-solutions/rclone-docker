@@ -44,13 +44,13 @@
  *
  * Example mount command from a client:
  * ------------------------------------
- * sudo mount -t nfs -o vers=3 <server_ip>:/export /mnt
+ * sudo mount -t nfs -o vers=3,proto=tcp,nolock,mountproto=tcp \
+ *      <server_ip>:/ /mnt
  *
- * Note: the kernel exportfs path is /export (not /) so the underlying
- * filesystem for that path supports NFS export (overlay/overlayfs does
- * not). The container/runtime is responsible for ensuring /export exists
- * on a supported filesystem, typically by mounting a tmpfs there before
- * rcnfs runs. rclone serves the remote regardless of the export path.
+ * Note: rclone serve nfs implements both NFS and MOUNT on the same TCP
+ * port using its own file-handle namespace, so the kernel rpc.mountd
+ * and exportfs are not used. The MOUNT path is opaque to rclone (it
+ * always returns the rclone remote root regardless of what is asked).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -592,20 +592,22 @@ free_buckets() {
  */
 void
 startup() {
-    /* TODO: We need a new driver allowing to set the port. 
+    /* TODO: We need a new driver allowing to set the port.
      * Even then I don't know how we will advertise the port to the user??
      * Till then foce the port to 2049
-     */ 
+     */
     /* port = free_port(); */
     port = 2049;
     if (port < 0) goto error;
     if (is_port_free(port) != 1) goto error;
     if (fake_root_handle() < 0) goto error;
-    if (mount_nfsd() < 0) goto error;
-    if (spawn_mountd() < 0) goto error;
+    /* rclone serve nfs implements both NFS and MOUNT on the same TCP port
+     * with its own file-handle namespace. We no longer rely on kernel
+     * rpc.mountd / exportfs / nfsd - they handed out handles rclone could
+     * not interpret. register_rclone() points MOUNT at rclone instead.
+     */
     if (spawn_rclone() < 0) goto error;
     if (register_rclone() < 0) goto error;
-    if (exportfs() < 0) goto error;
     printf("rclone NFS started.\n");
     return;
 error:
@@ -624,10 +626,8 @@ error:
  */
 void
 teardown() {
-    unexportfs();
     unregister_rclone();
-    kill_rclone();
-    kill_mountd();
+    if (rclone_pid > 0) kill_rclone();
     free_buckets();
     printf("rclone NFS program stopped.\n");
 }

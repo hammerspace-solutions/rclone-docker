@@ -72,7 +72,9 @@ RUN chmod 0755 /usr/bin/rclone /usr/bin/rcnfs /usr/local/bin/entrypoint.sh && \
 ENV RCLONE_CONFIG=/config/rclone/rclone.conf
 
 # Informational - these need to be reachable from clients.
-# Use --network host (recommended) or publish all of them when running.
-EXPOSE 111/tcp 111/udp 2049/tcp 2049/udp 20048/tcp 20048/udp
+# rclone serves NFS and MOUNT on the same TCP/2049, so the kernel mountd's
+# dynamic port range is no longer in play. Use --network host (recommended)
+# or publish both ports when running.
+EXPOSE 111/tcp 111/udp 2049/tcp
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
