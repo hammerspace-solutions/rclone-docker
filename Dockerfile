@@ -26,6 +26,17 @@ RUN git clone https://github.com/rclone/rclone.git rclone && \
     cd rclone && \
     git checkout "${RCLONE_REF}"
 
+# Pull the same go-nfs revision rclone depends on so we can patch it.
+ARG GO_NFS_REF=v0.0.4
+RUN git clone --depth 1 --branch "${GO_NFS_REF}" \
+        https://github.com/willscott/go-nfs.git /src/go-nfs
+
+# Drop in the MOUNTPROC_EXPORT handler (see patches/go-nfs/mount_export.go
+# for the rationale). Then tell rclone's build to use our patched copy.
+COPY patches/go-nfs/mount_export.go /src/go-nfs/mount_export.go
+RUN cd /src/rclone && \
+    go mod edit -replace=github.com/willscott/go-nfs=/src/go-nfs
+
 WORKDIR /src/rclone
 # serve nfs does not require fuse/cmount, so a pure-Go build is fine
 RUN mkdir -p /out && \
