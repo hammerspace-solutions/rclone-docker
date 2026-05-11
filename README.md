@@ -10,8 +10,8 @@ discover and mount it. Registration is handled by a small C helper, `rcnfs`, whi
 - [Why this exists](#why-this-exists)
 - [How it works](#how-it-works)
 - [Prerequisites](#prerequisites)
-  - [Host kernel](#host-kernel)
   - [Host ports](#host-ports)
+  - [Host firewall](#host-firewall)
 - [Repository layout](#repository-layout)
 - [Build the image](#build-the-image)
   - [Pin an rclone version](#pin-an-rclone-version)
@@ -39,14 +39,21 @@ locate the NFS server (the typical case for `mount -t nfs ...`) therefore can't 
 
 `rcnfs` (the binary built from `rcnfs.c`) bridges that gap:
 
-1. Pins `rclone serve nfs` to port **2049** and launches it.
-2. Spawns the kernel `rpc.mountd` daemon for the MOUNT protocol.
-3. Registers NFS v3 / TCP / port 2049 with `rpcbind` via `pmap_set`.
-4. Runs `exportfs` to advertise `/` to the world (and optionally to a single "anvil" host).
-5. Handles `SIGTERM`/`SIGINT` to unregister and tear everything down cleanly.
+1. Launches `rclone serve nfs` pinned to port **2049**.
+2. Registers both the NFS program (100003) and the MOUNT program (100005, v1–v3) with
+   `rpcbind` via `pmap_set`, both pointing at port 2049 — `rclone serve nfs` answers MOUNT
+   on the same TCP port as NFS, using its own file-handle namespace.
+3. Handles `SIGTERM`/`SIGINT` to unregister from portmapper and shut `rclone` down cleanly.
 
-This image packages `rclone`, `rcnfs`, `rpcbind`, and the userspace NFS utilities so that the
-whole stack runs in one container.
+Because rclone handles MOUNT itself, the image does **not** spawn the kernel `rpc.mountd`
+and does **not** run `exportfs` — those would hand clients kernel-format file handles that
+rclone's NFS server cannot interpret.
+
+The image also includes a small patch to `willscott/go-nfs` (rclone's NFS server library)
+that implements `MOUNTPROC_EXPORT` so that `showmount -e` and storage-discovery probes
+(Hammerspace Anvil's "create storage system", monitoring scripts, etc.) get a proper export
+list back. See `patches/go-nfs/mount_export.go` and upstream PR
+[willscott/go-nfs#152](https://github.com/willscott/go-nfs/pull/152).
 
 ## How it works
 
@@ -125,11 +132,15 @@ REJECT with ICMP unreachable) or `Connection timed out` (silent DROP) while `pin
 
 ```
 .
-├── Dockerfile           # 3-stage build: rclone, rcnfs, runtime
-├── docker-compose.yml   # opinionated run profile
-├── entrypoint.sh        # boots rpcbind, then execs rcnfs
-├── rcnfs.c              # portmapper / mountd helper (source)
+├── Dockerfile                       # 3-stage build: rclone, rcnfs, runtime
+├── docker-compose.yml               # opinionated run profile
+├── entrypoint.sh                    # boots/reuses rpcbind, then execs rcnfs
+├── rcnfs.c                          # portmapper registration helper (source)
+├── patches/
+│   └── go-nfs/
+│       └── mount_export.go          # adds MOUNTPROC_EXPORT to rclone's NFS lib
 ├── .dockerignore
+├── .gitignore
 └── README.md
 ```
 
@@ -143,13 +154,16 @@ docker build -t rclone-nfs:latest .
 
 This will:
 
-1. Clone `https://github.com/rclone/rclone.git` and build `rclone` (Go, CGO disabled).
+1. Clone `https://github.com/rclone/rclone.git`, clone `willscott/go-nfs` at the version
+   rclone pins, drop in `patches/go-nfs/mount_export.go`, and build `rclone` against the
+   patched library via `go mod replace` (Go, CGO disabled).
 2. Compile `rcnfs.c` against `libtirpc`.
 3. Assemble a runtime image based on `ubuntu:24.04` containing both binaries,
-   `rpcbind`, `nfs-kernel-server`, `nfs-common`, and `tini`.
+   `rpcbind`, `nfs-common`, and `tini`.
 
 The first build takes a few minutes (most of it is the rclone Go compile). Subsequent builds
-are cached unless you change `rcnfs.c`, the Dockerfile, or pass a new `RCLONE_REF`.
+are cached unless you change `rcnfs.c`, the Dockerfile, the patch, or pass a new `RCLONE_REF`
+or `GO_NFS_REF`.
 
 ### Pin an rclone version
 
@@ -207,16 +221,9 @@ docker run -d \
 Replace `S3:my-bucket` with the remote name from your `rclone.conf` (and optionally one or
 more bucket names separated by colons — see [`rcnfs` command-line](#rcnfs-command-line)).
 
-If you need to restrict full-access to a specific "anvil" host while still exporting read-only
-to the world:
-
-```bash
-docker run -d --name rclone-nfs \
-    --network host --cap-add SYS_ADMIN \
-    -v "$(pwd)/config:/config" -v rclone-cache:/var/cache/rclone \
-    rclone-nfs:latest \
-    -a 10.200.104.39 S3:my-bucket
-```
+The legacy `-a ANVIL_IP` flag is still accepted for backwards compatibility but is currently a
+no-op (since this image no longer uses kernel `exportfs`). All clients have equal access; if
+you need IP-based restrictions, do them at the host firewall layer.
 
 ### With Docker Compose
 
@@ -272,7 +279,18 @@ Expected output from `rpcinfo -p` includes lines like:
 ```
   100000  4    tcp    111  portmapper
   100003  3    tcp   2049  nfs
-  100005  3    tcp  20048  mountd
+  100005  3    tcp   2049  mountd
+```
+
+Note that **both** `nfs` and `mountd` show port **2049** — that's by design (rclone serves
+both protocols on the same TCP port). If `mountd` shows a different port, an external
+`rpc.mountd` has taken over the MOUNT registration; restart the container.
+
+`showmount -e <docker-host-ip>` should return:
+
+```
+Export list for <host>:
+/ (everyone)
 ```
 
 ## Logs and lifecycle
@@ -283,8 +301,8 @@ docker stop rclone-nfs           # graceful shutdown (SIGTERM triggers rcnfs tea
 docker restart rclone-nfs        # restart in place
 ```
 
-When `rcnfs` receives `SIGTERM` it unexports, unregisters from rpcbind, and kills both
-`rpc.mountd` and `rclone serve nfs` before exiting.
+When `rcnfs` receives `SIGTERM` it unregisters NFS and MOUNT from rpcbind and shuts
+`rclone serve nfs` down before exiting.
 
 ## Configuration reference
 
@@ -391,8 +409,12 @@ docker logs rclone-nfs   # rclone's own log lines
 ## Limitations
 
 - **NFSv3 only.** rclone's NFS server does not implement NFSv4.
+- **No NLM locking.** Clients must mount with `-o nolock`; there is no `rpc.statd` in the
+  container.
+- **No per-host access control inside the image.** The legacy `-a ANVIL_IP` flag is accepted
+  but ignored. Use the host firewall (`firewalld` rich rules, `ufw`, `iptables`) if you need
+  IP-based restrictions.
 - **Exports the root of the remote** (optionally narrowed to specified buckets). There is no
   way to export an arbitrary subdirectory via `rcnfs` today.
 - **Single-remote per container.** To serve multiple remotes, run multiple containers (each on
   a different host or with their own IP / network namespace, since they all want port 2049).
-- **Linux hosts only** — see the [Host kernel](#host-kernel) note about Docker Desktop.

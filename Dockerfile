@@ -1,13 +1,20 @@
 # syntax=docker/dockerfile:1.7
 #
-# rclone-nfs: rclone NFS server with portmapper/mountd registration
+# rclone-nfs: rclone serve nfs + rpcbind registration in one container.
+# rclone handles both NFS and MOUNT on TCP/2049; rcnfs registers both
+# programs with portmapper so standard NFS clients can discover them.
 # Built in three stages:
-#   1. rclone-builder  -> builds rclone from https://github.com/rclone/rclone.git
-#   2. rcnfs-builder   -> compiles rcnfs.c against libtirpc
-#   3. runtime         -> Ubuntu 24.04 + nfs-kernel-server + rpcbind
+#   1. rclone-builder  -> clones rclone, clones go-nfs at the matching tag,
+#                         applies patches/go-nfs/mount_export.go (adds the
+#                         MOUNTPROC_EXPORT handler that showmount -e needs),
+#                         then builds rclone with `go mod replace` pointing
+#                         at the patched go-nfs.
+#   2. rcnfs-builder   -> compiles rcnfs.c against libtirpc.
+#   3. runtime         -> Ubuntu 24.04 + rpcbind + nfs-common + tini.
 #
-# Override the rclone revision at build time:
-#   docker build --build-arg RCLONE_REF=v1.68.2 -t rclone-nfs .
+# Override the rclone revision (and the matching go-nfs tag) at build time:
+#   docker build --build-arg RCLONE_REF=v1.68.2 --build-arg GO_NFS_REF=v0.0.4 \
+#                -t rclone-nfs .
 
 ARG RCLONE_REF=master
 

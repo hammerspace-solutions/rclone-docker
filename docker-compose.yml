@@ -6,20 +6,20 @@ services:
         RCLONE_REF: master
     image: rclone-nfs:latest
     container_name: rclone-nfs
-    # Host networking is the path of least resistance for portmapper +
-    # mountd's dynamic ports. If you must use bridge mode, publish 111,
-    # 2049, and pin mountd to a known port instead.
+    # Host networking is the path of least resistance: rclone serves both NFS
+    # and MOUNT on TCP/2049 and rpcbind sits on 111. Bridge mode requires
+    # publishing both ports and works as long as clients can reach the host.
     network_mode: host
-    # rcnfs mounts the kernel "nfsd" pseudo-fs and calls exportfs, which
-    # needs CAP_SYS_ADMIN. Use --privileged if SYS_ADMIN alone is rejected
-    # by your host's seccomp/apparmor profile.
+    # The container's rpcbind needs to bind privileged port 111. Use
+    # --privileged if SYS_ADMIN is rejected by your host's seccomp/apparmor.
     cap_add:
       - SYS_ADMIN
     volumes:
       - ./config:/config
       - rclone-cache:/var/cache/rclone
-    # Edit this for your remote (and optional buckets):
-    #   command: ["-a", "10.200.104.39", "S3:hs-rclone"]
+    # Edit this for your remote (and optional buckets). One bucket is served
+    # directly (no ListBuckets needed); two or more uses an --include filter.
+    #   command: ["S3:bucket-a:bucket-b"]
     command: ["S3:my-bucket"]
     restart: unless-stopped
 
