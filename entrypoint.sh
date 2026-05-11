@@ -54,22 +54,36 @@ else
     fi
 fi
 
-echo "[entrypoint] Starting rpcbind..."
-# -w: read previous registrations from /run/rpcbind/rpcbind.xdr if present
-/sbin/rpcbind -w
-
-# Wait briefly for rpcbind to answer, otherwise pmap_set in rcnfs will fail
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    if rpcinfo -T udp 127.0.0.1 portmapper >/dev/null 2>&1; then
-        echo "[entrypoint] rpcbind is up."
-        break
+# With --network host, port 111 lives in the host's network namespace. If the
+# host already runs its own rpcbind, our container's rpcbind cannot bind 111
+# and ends up registering only on its private Unix socket - invisible to NFS
+# clients. Detect that case and skip our rpcbind so libtirpc/pmap_set falls
+# back to TCP loopback and reaches whoever owns port 111.
+if rpcinfo -T tcp 127.0.0.1 portmapper >/dev/null 2>&1; then
+    echo "[entrypoint] External rpcbind already on 127.0.0.1:111, reusing it."
+    # Remove any stale unix socket inside the container so libtirpc does not
+    # silently route registrations to a dead local rpcbind.
+    rm -f /run/rpcbind.sock /var/run/rpcbind.sock 2>/dev/null || true
+    if ! rpcinfo -p 127.0.0.1 >/dev/null 2>&1; then
+        echo "ERROR: existing rpcbind on 127.0.0.1:111 is not answering." >&2
+        echo "Stop it on the host or run the container in its own netns." >&2
+        exit 1
     fi
-    sleep 0.5
-done
-
-if ! rpcinfo -T udp 127.0.0.1 portmapper >/dev/null 2>&1; then
-    echo "ERROR: rpcbind did not come up in time." >&2
-    exit 1
+else
+    echo "[entrypoint] Starting rpcbind..."
+    # -w: read previous registrations from /run/rpcbind/rpcbind.xdr if present
+    /sbin/rpcbind -w
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if rpcinfo -T udp 127.0.0.1 portmapper >/dev/null 2>&1; then
+            echo "[entrypoint] rpcbind is up."
+            break
+        fi
+        sleep 0.5
+    done
+    if ! rpcinfo -T udp 127.0.0.1 portmapper >/dev/null 2>&1; then
+        echo "ERROR: rpcbind did not come up in time." >&2
+        exit 1
+    fi
 fi
 
 echo "[entrypoint] Starting rcnfs $*"

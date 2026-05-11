@@ -357,6 +357,28 @@ The `nfsd` kernel module is not loaded or the container lacks `CAP_SYS_ADMIN`. R
 `rpcbind` did not start in time, or another `rpcbind` is already running on the host (port 111
 collision under `--network host`). Stop the host's `rpcbind` service.
 
+**Client gets `requested NFS version or transport protocol is not supported` but the container
+logs look fine**
+The container is registering NFS/mountd into its **own** rpcbind via a private Unix socket
+because the host has its own `rpcbind` already bound to port 111. Clients query the host's
+rpcbind on 111 and get nothing useful back. Verify with `rpcinfo -p 127.0.0.1` on the docker
+host — if you do **not** see `100003 ... nfs` and `100005 ... mountd`, this is the case.
+
+Fix by stopping the host's rpcbind so the container's takes port 111:
+```bash
+sudo systemctl disable --now rpcbind rpcbind.socket
+docker restart rclone-nfs
+```
+The entrypoint also auto-detects this situation as of the current image — it will reuse the
+host's rpcbind if one is already listening on 127.0.0.1:111 rather than starting a competing
+one. So an alternative is to keep the host's rpcbind and let it carry the registrations.
+
+When mounting from the client, use TCP and disable locking (rclone doesn't run `rpc.statd`):
+```bash
+sudo mount -t nfs -o vers=3,proto=tcp,nolock,mountproto=tcp \
+    <server>:/export /mnt/rclone
+```
+
 **`bind: Address already in use` on port 2049**
 The host's `nfs-kernel-server` is running. `sudo systemctl disable --now nfs-server`.
 
