@@ -80,6 +80,7 @@ struct Bucket {
 
 const unsigned long NFS_PROGRAM = 100003;
 const unsigned long NFS_VERSION = 3;
+const unsigned long MOUNT_PROGRAM = 100005;
 
 static int mkdirs(const char *path); 
 static int fake_root_handle();
@@ -529,6 +530,21 @@ register_rclone() {
         return -1;
     }
     printf("rclone NFS program registered with rpcbind (prog: %ld, vers: %ld).\n", NFS_PROGRAM, NFS_VERSION);
+
+    /* rclone serve nfs implements the MOUNT protocol on the same TCP port,
+     * and uses its own file-handle namespace. The kernel rpc.mountd hands
+     * out tmpfs handles that rclone does not recognize ("Bad file handle
+     * suffix"), so we must override mountd's portmapper registration and
+     * point MOUNT at rclone instead. v1/v2/v3 because clients may pick any.
+     */
+    for (unsigned long v = 1; v <= 3; v++) {
+        pmap_unset(MOUNT_PROGRAM, v);
+        if (!pmap_set(MOUNT_PROGRAM, v, IPPROTO_TCP, port)) {
+            fprintf(stderr, "failed to register MOUNT v%lu with rpcbind.\n", v);
+            return -1;
+        }
+    }
+    printf("rclone MOUNT (v1-v3) registered with rpcbind on port %d.\n", port);
     return 0;
 }
 
@@ -544,7 +560,10 @@ unregister_rclone() {
         fprintf(stderr, "failed to unregister rclone NFS program from rpcbind.\n");
         return -1;
     }
-    printf("unregistered rclone NFS program from rpcbind.\n");
+    for (unsigned long v = 1; v <= 3; v++) {
+        pmap_unset(MOUNT_PROGRAM, v);
+    }
+    printf("unregistered rclone NFS/MOUNT programs from rpcbind.\n");
     return 0;
 }
 
