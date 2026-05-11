@@ -1,0 +1,15 @@
+# Claude Code session state
+.claude/
+
+# Local rclone config (may contain credentials)
+config/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~
+
+# Compiled artifacts (build happens inside Docker)
+rcnfs
+rclone
+rclone.new

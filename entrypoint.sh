@@ -1,0 +1,76 @@
+#!/bin/bash
+set -euo pipefail
+
+# Pass-through mode: anything other than the NFS-serve flow (rclone config,
+# bash, rclone version, etc.) just execs the requested command.
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        rclone|bash|sh|rclone-config|rcnfs-help|--help|-h)
+            exec "$@"
+            ;;
+    esac
+fi
+
+CONFIG_FILE="${RCLONE_CONFIG:-/config/rclone/rclone.conf}"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: rclone config not found at $CONFIG_FILE" >&2
+    echo "Generate one first, e.g.:" >&2
+    echo "  docker run -it --rm -v \$(pwd)/config:/config <image> rclone config" >&2
+    exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+    cat >&2 <<'EOF'
+ERROR: missing remote argument.
+
+Usage:
+    docker run ... <image> [-a ANVIL_IP] REMOTE:[BUCKET[:BUCKET...]]
+
+Example:
+    docker run -d --network host --cap-add SYS_ADMIN \
+        -v $(pwd)/config:/config \
+        rclone-nfs S3:my-bucket
+EOF
+    exit 2
+fi
+
+# rpcbind and rpc.mountd need these to exist
+mkdir -p /run/rpcbind /var/lib/nfs /export
+touch /var/lib/nfs/etab /var/lib/nfs/rmtab
+
+# rcnfs exports /export, not /, because overlay2 (the typical container root
+# filesystem) does not support being NFS-exported. Mount a tmpfs there if the
+# path is still on the overlay. Requires CAP_SYS_ADMIN.
+if mountpoint -q /export; then
+    echo "[entrypoint] /export is already a mountpoint, leaving it alone."
+else
+    echo "[entrypoint] Mounting tmpfs on /export..."
+    if ! mount -t tmpfs -o size=16m,mode=0755 tmpfs /export; then
+        echo "ERROR: failed to mount tmpfs on /export." >&2
+        echo "Run the container with --cap-add SYS_ADMIN (or --privileged), or" >&2
+        echo "pre-bind a real filesystem to /export via -v / --tmpfs." >&2
+        exit 1
+    fi
+fi
+
+echo "[entrypoint] Starting rpcbind..."
+# -w: read previous registrations from /run/rpcbind/rpcbind.xdr if present
+/sbin/rpcbind -w
+
+# Wait briefly for rpcbind to answer, otherwise pmap_set in rcnfs will fail
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if rpcinfo -T udp 127.0.0.1 portmapper >/dev/null 2>&1; then
+        echo "[entrypoint] rpcbind is up."
+        break
+    fi
+    sleep 0.5
+done
+
+if ! rpcinfo -T udp 127.0.0.1 portmapper >/dev/null 2>&1; then
+    echo "ERROR: rpcbind did not come up in time." >&2
+    exit 1
+fi
+
+echo "[entrypoint] Starting rcnfs $*"
+exec /usr/bin/rcnfs "$@"
