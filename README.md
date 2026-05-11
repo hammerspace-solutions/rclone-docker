@@ -94,6 +94,33 @@ for registrations. If the host runs `nfs-kernel-server`, port 2049 is taken — 
 sudo systemctl disable --now nfs-server
 ```
 
+### Host firewall
+
+If the host runs `firewalld` (RHEL / Rocky / Fedora / etc.) or any equivalent, NFS ports
+must be opened explicitly. With `--network host` the container's listeners sit on the host's
+real interfaces and are filtered like any host process. ICMP usually works by default, so
+`ping` succeeding does **not** mean the firewall is open.
+
+For `firewalld`:
+
+```bash
+sudo firewall-cmd --permanent --add-service=nfs
+sudo firewall-cmd --permanent --add-service=rpc-bind
+sudo firewall-cmd --reload
+```
+
+For `ufw` (Ubuntu / Debian):
+
+```bash
+sudo ufw allow 111/tcp
+sudo ufw allow 111/udp
+sudo ufw allow 2049/tcp
+```
+
+Telltale symptom of this not being done: clients receive `No route to host` (firewall
+REJECT with ICMP unreachable) or `Connection timed out` (silent DROP) while `ping` and
+`ssh` to the same host work fine.
+
 ## Repository layout
 
 ```
