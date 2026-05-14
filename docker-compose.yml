@@ -14,13 +14,14 @@ services:
     # --privileged if SYS_ADMIN is rejected by your host's seccomp/apparmor.
     cap_add:
       - SYS_ADMIN
+    environment:
+      - RCLONE_NO_CHECK_CERTIFICATE=true
     volumes:
       - ./config:/config
       - rclone-cache:/var/cache/rclone
     # Edit this for your remote (and optional buckets). One bucket is served
     # directly (no ListBuckets needed); two or more uses an --include filter.
-    #   command: ["S3:bucket-a:bucket-b"]
-    command: ["S3:my-bucket"]
+    command: ["psminio:clu-b"]
     restart: unless-stopped
 
 volumes:

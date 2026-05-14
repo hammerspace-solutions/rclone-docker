@@ -18,7 +18,11 @@ discover and mount it. Registration is handled by a small C helper, `rcnfs`, whi
 - [Generate an rclone config](#generate-an-rclone-config)
 - [Run the container](#run-the-container)
   - [With `docker run`](#with-docker-run)
-  - [With Docker Compose](#with-docker-compose)
+  - [With `docker compose`](#with-docker-compose)
+- [Verify rclone access to the S3 storage](verify-rclone-access-to-the-s3-storage)
+  - [Access the container bash session](access-the-container-bash-session)
+  - [Use `rclone lsd` to list all buckets](use-rclone-lsd-to-list-all-buckets)
+  - [Use `rclone ls` to list bucket contents](use-rclone-ls-to-list-bucket-contents)
 - [Mount the export from a client](#mount-the-export-from-a-client)
 - [Verify the service](#verify-the-service)
 - [Logs and lifecycle](#logs-and-lifecycle)
@@ -146,9 +150,23 @@ REJECT with ICMP unreachable) or `Connection timed out` (silent DROP) while `pin
 
 ## Build the image
 
+If not already installed, install, enable, and start Docker using your preferred package manager. Additional packages may also be required; install those as needed.
+
+### Create your repository root:
+```bash
+mkdir /opt/install`
+```
+###Clone the Hammerspace rclone-docker repository
+
+```bash
+cd /opt/install
+git clone https://github.com/hammerspace-solutions/rclone-docker.git
+```
+
 From the repository root:
 
 ```bash
+cd /opt/install/rclone-docker
 docker build -t rclone-nfs:latest .
 ```
 
@@ -187,6 +205,7 @@ way to create one is to run `rclone config` interactively **inside the same imag
 file is written by the same rclone version that will serve it:
 
 ```bash
+cd /opt/install/rclone-docker
 mkdir -p config
 docker run -it --rm \
     -v "$(pwd)/config:/config" \
@@ -204,9 +223,12 @@ docker run -it --rm \
 
 You only need one of the two methods below.
 
+**Note**: If your S3 storage provider uses a self-signed SSL certificate, you should use the [With Docker Compose](#with-docker-compose) option to run the container. The `docker-compose.yml` file used by `docker compose` includes the option to bypass SSL certificate checking
+
 ### With `docker run`
 
 ```bash
+cd /opt/install/rclone-docker
 docker run -d \
     --name rclone-nfs \
     --network host \
@@ -225,11 +247,18 @@ The legacy `-a ANVIL_IP` flag is still accepted for backwards compatibility but 
 no-op (since this image no longer uses kernel `exportfs`). All clients have equal access; if
 you need IP-based restrictions, do them at the host firewall layer.
 
-### With Docker Compose
+### With `docker compose`
 
-Edit the `command:` line in `docker-compose.yml` to reference your remote, then:
+Make the following changes to `docker-compose.yml`:
+
+- Edit the `S3:my-bucket` with the remote name from your `rclone.conf` (and optionally one or
+more bucket names separated by colons — see [`rcnfs` command-line](#rcnfs-command-line)).
+- To **enable** SSL certificate verification, change `RCLONE_NO_CHECK_CERTIFICATE` to `false`, instead of `true` (the default).
+
+Once complete, execute the following commands:
 
 ```bash
+cd /opt/install/rclone-docker
 docker compose up -d
 docker compose logs -f
 ```
@@ -240,9 +269,44 @@ Stop and tear down with:
 docker compose down
 ```
 
+## Verify rclone access to the S3 storage
+
+The following steps can be used to verify that the rclone connection to the S3 bucket is working correctly.
+
+To see additional rclone commands not shown here, enter `rclone` from within the container bash session.
+
+### Access the container bash session
+
+```bash
+cd /opt/install/rclone-docker
+docker exec -it rclone-nfs /bin/bash
+```
+
+Note: Once you are finished, enter `exit` to return to the host OS.
+
+### Use `rclone lsd` to list all buckets
+
+Update the remote name (aws-us:) to match your remote.
+
+```bash
+rclone lsd aws-us:
+          -1 2023-07-21 17:07:25        -1 prod
+          -1 2023-07-21 17:07:31        -1 stage
+          -1 2025-01-24 11:36:39        -1 dev
+```
+
+### Use `rclone ls` to list bucket contents
+
+```bash
+rclone ls aws-us:prod | more
+  4194304 June2026/000201/Q2-EOQreport.xlsx
+  4194304 March2026/000101/Q1-EOQreport.xlsx
+  ...
+```
+
 ## Mount the export from a client
 
-From any Linux NFS client on the same network as the Docker host:
+From any Linux NFS client on the same network as the Docker host, use the following commands to mount the export:
 
 ```bash
 sudo mkdir -p /mnt/rclone
@@ -261,6 +325,8 @@ The required options are:
 
 The path after the colon is ignored by rclone (its MOUNT handler always returns the rclone
 remote's root regardless), so `:/`, `:/foo`, and `:/anything` are equivalent.
+
+**Note**: If your intention is to assimilate this data into Hammerspace, add the rclone server as storage system type **Other NFS**. Once added, you would assimilate the `/mnt/rclone` volume as read-only, similar to any other NFS volume.
 
 ## Verify the service
 
